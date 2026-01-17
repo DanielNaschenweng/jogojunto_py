@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from collections import defaultdict
 from dotenv import load_dotenv
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
@@ -401,11 +401,11 @@ def generate_termo_pdf(output_file='termo_responsabilidade.pdf', num_linhas=30):
     try:
         doc = SimpleDocTemplate(
             output_file,
-            pagesize=A4,
-            rightMargin=2*cm,
-            leftMargin=2*cm,
-            topMargin=1.5*cm,
-            bottomMargin=1.5*cm
+            pagesize=landscape(A4),
+            rightMargin=1.5*cm,
+            leftMargin=1.5*cm,
+            topMargin=1*cm,
+            bottomMargin=1*cm
         )
 
         elements = []
@@ -510,7 +510,8 @@ def generate_termo_pdf(output_file='termo_responsabilidade.pdf', num_linhas=30):
         for i in range(1, num_linhas + 1):
             table_data.append([str(i), '', '', '', ''])
 
-        col_widths = [0.8*cm, 5.5*cm, 3*cm, 3*cm, 4*cm]
+        # A4 landscape = 29.7cm, margins = 1.5cm each side, available = 26.7cm
+        col_widths = [1*cm, 9.7*cm, 5*cm, 5*cm, 6*cm]
         table = Table(table_data, colWidths=col_widths, repeatRows=1)
 
         table.setStyle(TableStyle([
@@ -520,13 +521,13 @@ def generate_termo_pdf(output_file='termo_responsabilidade.pdf', num_linhas=30):
             ('ALIGN', (0, 1), (0, -1), 'CENTER'),
             ('ALIGN', (1, 1), (-1, -1), 'LEFT'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('TOPPADDING', (0, 0), (-1, 0), 8),
+            ('FONTSIZE', (0, 0), (-1, 0), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+            ('TOPPADDING', (0, 0), (-1, 0), 6),
             ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 12),
-            ('TOPPADDING', (0, 1), (-1, -1), 12),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 10),
+            ('TOPPADDING', (0, 1), (-1, -1), 10),
             ('GRID', (0, 0), (-1, -1), 1, colors.black),
             ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f5f5')]),
         ]))
