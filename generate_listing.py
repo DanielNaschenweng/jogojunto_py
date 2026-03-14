@@ -8,6 +8,8 @@ import os
 import sys
 import re
 import csv
+import json
+from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from collections import defaultdict
@@ -23,7 +25,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 # CONSTANTES DO EVENTO - Altere aqui para atualizar as datas
 # ============================================================
 EVENTO_NOME = "Encontro de Jogos de Tabuleiro - Joga Junto"
-EVENTO_DATA = "17 de janeiro de 2026"
+EVENTO_DATA = "21 de fevereiro de 2026"
 EVENTO_LOCAL = "Shopping 13 de Maio"
 EVENTO_CIDADE = "Indaiatuba"
 
@@ -36,7 +38,7 @@ def get_dynamodb_client():
     aws_region = os.getenv('AWS_REGION', 'us-east-1')
     aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
     aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-    
+
     try:
         if aws_access_key_id and aws_secret_access_key:
             dynamodb = boto3.resource(
@@ -48,7 +50,7 @@ def get_dynamodb_client():
         else:
             # Use default credentials (from ~/.aws/credentials or IAM role)
             dynamodb = boto3.resource('dynamodb', region_name=aws_region)
-        
+
         return dynamodb
     except NoCredentialsError:
         print("Error: AWS credentials not found. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY or configure AWS CLI.", file=sys.stderr)
@@ -62,17 +64,17 @@ def fetch_registrations(dynamodb, table_name='JogaJuntoRegistrations'):
     """Fetch all registrations from JogaJuntoRegistrations table."""
     try:
         table = dynamodb.Table(table_name)
-        
+
         # Scan the entire table
         registrations = []
         response = table.scan()
         registrations.extend(response.get('Items', []))
-        
+
         # Handle pagination if there are more items
         while 'LastEvaluatedKey' in response:
             response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
             registrations.extend(response.get('Items', []))
-        
+
         return registrations
     except ClientError as e:
         print(f"Error fetching registrations from DynamoDB: {e}", file=sys.stderr)
@@ -94,6 +96,8 @@ def extract_dynamodb_value(value):
             return value['BOOL']
         elif 'L' in value:  # List
             return [extract_dynamodb_value(item) for item in value['L']]
+        elif 'M' in value:  # Map
+            return {k: extract_dynamodb_value(v) for k, v in value['M'].items()}
         elif 'SS' in value:  # String Set
             return list(value['SS'])
         elif 'NS' in value:  # Number Set
@@ -104,23 +108,99 @@ def extract_dynamodb_value(value):
     return value
 
 
+def get_current_edition():
+    """Get the current edition string in MM-YYYY format based on current month and year."""
+    now = datetime.now()
+    return f"{now.month:02d}-{now.year}"
+
+
+def filter_by_edition(registrations, edition):
+    """Filter registrations by edition (edicao field) and status == 'paid'."""
+    filtered = []
+    for reg in registrations:
+        edicao = extract_dynamodb_value(reg.get('edicao', ''))
+        status = extract_dynamodb_value(reg.get('status', ''))
+        if edicao and str(edicao).strip() == edition and status == 'paid':
+            filtered.append(reg)
+    return filtered
+
+
+def deduplicate_by_id(registrations):
+    """Remove duplicate registrations by id, keeping only one entry per id."""
+    seen_ids = set()
+    unique = []
+    for reg in registrations:
+        reg_id = extract_dynamodb_value(reg.get('id', ''))
+        if reg_id and reg_id in seen_ids:
+            continue
+        if reg_id:
+            seen_ids.add(reg_id)
+        unique.append(reg)
+    return unique
+
+
 def capitalize_name(name):
-    """Capitalize name: first letter uppercase, rest lowercase."""
+    """Capitalize name: first letter of each word uppercase, rest lowercase."""
     if not name:
         return name
-    return name.capitalize()
+    return name.title()
+
+
+def expand_participants(registrations):
+    """Expande inscrições incluindo participantes em 'outros'.
+
+    Retorna lista flat de participantes com: nomeCompleto, dataNascimento,
+    e campos gerais da inscrição. O campo 'outros' no registro principal
+    é serializado como string legível (lista de nomes).
+    """
+    participants = []
+    for reg in registrations:
+        # Extract outros before building base
+        outros_raw = extract_dynamodb_value(reg.get('outros', []))
+        outros_list = outros_raw if isinstance(outros_raw, list) else []
+
+        # Serialize outros as readable string for the principal row
+        outros_names = []
+        for outro in outros_list:
+            if isinstance(outro, dict):
+                nome = outro.get('nomeCompleto', '')
+                if nome:
+                    outros_names.append(str(nome))
+
+        # Build base with all fields extracted (outros serialized as string)
+        base = {}
+        for k, v in reg.items():
+            if k == 'outros':
+                base['outros'] = '; '.join(outros_names)
+            else:
+                base[k] = extract_dynamodb_value(v)
+
+        # Participante principal
+        participants.append(base)
+
+        # Outros participantes (dependentes)
+        for outro in outros_list:
+            if isinstance(outro, dict):
+                row = dict(base)
+                row['nomeCompleto'] = outro.get('nomeCompleto', '')
+                row['dataNascimento'] = outro.get('dataNascimento', '')
+                row['outros'] = ''
+                row['_is_dependente'] = True
+                participants.append(row)
+
+    return participants
 
 
 def process_registrations(registrations):
-    """Process registrations and group games by user."""
+    """Process registrations and group games by user (principal only)."""
     user_games = defaultdict(list)
-    
+
     for reg in registrations:
         # Extract user name - prioritize nomeCompleto
         user_name = None
         if 'nomeCompleto' in reg:
             user_name = extract_dynamodb_value(reg['nomeCompleto'])
-        
+
         # If no nomeCompleto found, try other common field names
         if not user_name:
             for field in ['name', 'userName', 'user_name', 'nome', 'username', 'Name', 'UserName']:
@@ -128,13 +208,13 @@ def process_registrations(registrations):
                     user_name = extract_dynamodb_value(reg[field])
                     if user_name:
                         break
-        
+
         if not user_name:
             continue
-        
+
         # Capitalize user name
         user_name = capitalize_name(str(user_name))
-        
+
         # Extract games from 'jogos' field (string with line breaks, commas, or semicolons)
         games = []
         if 'jogos' in reg:
@@ -146,7 +226,7 @@ def process_registrations(registrations):
                     # Split by newline, comma, or semicolon - each game on a separate line
                     # Use regex to split by any of these delimiters
                     games = [g.strip() for g in re.split(r'[,\n;]+', games_raw) if g.strip()]
-        
+
         # Only add user if they have valid games
         if games:
             # Add games to user's list (avoid duplicates)
@@ -154,7 +234,7 @@ def process_registrations(registrations):
                 game_str = str(game).strip()
                 if game_str and game_str not in user_games[user_name]:
                     user_games[user_name].append(game_str)
-    
+
     return user_games
 
 
@@ -190,7 +270,7 @@ def generate_listing(user_games, output_file='games_listing.txt'):
         "O Cerco de Runedar",
         "Dogs"
     ]
-    
+
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             game_counter = 1
@@ -202,7 +282,7 @@ def generate_listing(user_games, output_file='games_listing.txt'):
                     f.write(f"   {game_counter}) {game}\n")
                     game_counter += 1
                 f.write("\n")
-            
+
             # Add fixed games at the end
             if fixed_games:
                 f.write("- Joga Junto (Jogos da Casa)\n")
@@ -210,7 +290,7 @@ def generate_listing(user_games, output_file='games_listing.txt'):
                     f.write(f"   {game_counter}) {game}\n")
                     game_counter += 1
                 f.write("\n")
-        
+
         print(f"Listing generated successfully: {output_file}")
         print(f"Total users: {len(user_games)}")
         total_games = sum(len(games) for games in user_games.values())
@@ -221,122 +301,111 @@ def generate_listing(user_games, output_file='games_listing.txt'):
 
 
 def generate_gamers_list(registrations, output_file='gamers.txt'):
-    """Generate list of participants in ascending order."""
+    """Generate list of participants (principal + dependentes) in ascending order."""
     try:
-        participants = []
-        
-        for reg in registrations:
-            # Extract user name - prioritize nomeCompleto
-            user_name = None
-            if 'nomeCompleto' in reg:
-                user_name = extract_dynamodb_value(reg['nomeCompleto'])
-            
-            # If no nomeCompleto found, try other common field names
-            if not user_name:
-                for field in ['name', 'userName', 'user_name', 'nome', 'username', 'Name', 'UserName']:
-                    if field in reg:
-                        user_name = extract_dynamodb_value(reg[field])
-                        if user_name:
-                            break
-            
+        participants_expanded = expand_participants(registrations)
+        names = []
+
+        for p in participants_expanded:
+            user_name = p.get('nomeCompleto', '')
+            if isinstance(user_name, str):
+                user_name = user_name.strip()
+            else:
+                user_name = str(user_name).strip() if user_name else ''
+
             if user_name:
-                # Capitalize user name
-                user_name = capitalize_name(str(user_name))
-                if user_name not in participants:
-                    participants.append(user_name)
-        
-        # Sort participants alphabetically
-        participants.sort()
-        
+                user_name = capitalize_name(user_name)
+                if user_name not in names:
+                    names.append(user_name)
+
+        names.sort()
+
         with open(output_file, 'w', encoding='utf-8') as f:
-            for participant in participants:
-                f.write(f"{participant}\n")
-        
+            for name in names:
+                f.write(f"{name}\n")
+
         print(f"Gamers list generated successfully: {output_file}")
-        print(f"Total participants: {len(participants)}")
+        print(f"Total participants: {len(names)}")
     except Exception as e:
         print(f"Error generating gamers list file: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 def generate_csv(registrations, output_file='registrations.csv'):
-    """Generate CSV file with all DynamoDB data."""
+    """Generate CSV file with all registrations, one row per participant."""
     try:
         if not registrations:
             print("No registrations to export.", file=sys.stderr)
             return
-        
-        # Get all unique field names from all registrations
+
+        participants = expand_participants(registrations)
+
+        # Desired field order
+        ordered_fields = [
+            'id', 'nomeCompleto', 'dataNascimento', 'email', 'celular', 'cidade', 'edicao',
+            'totalParticipantes', 'jogos', 'possuiJogos', 'interesseRPG', 'status',
+            'paidAt', 'payment_id', 'preference_id', 'createdAt', 'instagram',
+            'protecaoDados', 'usoImagem', 'outros',
+        ]
+
+        # Collect any extra fields not in the predefined order
         all_fields = set()
-        for reg in registrations:
-            all_fields.update(reg.keys())
-        
-        # Sort fields for consistent column order
-        # Put common fields first
-        common_fields = ['id', 'nomeCompleto', 'email', 'celular', 'cidade', 'dataNascimento', 
-                        'edicao', 'jogos', 'possuiJogos', 'interesseRPG', 'status', 
-                        'createdAt', 'instagram', 'protecaoDados', 'usoImagem']
-        ordered_fields = []
-        for field in common_fields:
-            if field in all_fields:
-                ordered_fields.append(field)
-                all_fields.remove(field)
-        # Add remaining fields
-        ordered_fields.extend(sorted(all_fields))
-        
+        for p in participants:
+            all_fields.update(k for k in p.keys() if k != '_is_dependente')
+
+        extra_fields = sorted(all_fields - set(ordered_fields))
+        final_fields = [f for f in ordered_fields if f in all_fields] + extra_fields
+
+        name_fields = {'nomeCompleto', 'name', 'userName', 'user_name', 'nome', 'username', 'Name', 'UserName'}
+
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=ordered_fields)
+            writer = csv.DictWriter(f, fieldnames=final_fields)
             writer.writeheader()
-            
-            for reg in registrations:
+
+            for p in participants:
                 row = {}
-                for field in ordered_fields:
-                    if field in reg:
-                        value = extract_dynamodb_value(reg[field])
-                        # Convert boolean and other types to string
-                        if isinstance(value, bool):
-                            row[field] = str(value)
-                        elif isinstance(value, list):
-                            row[field] = '; '.join(str(v) for v in value)
-                        elif value is None:
-                            row[field] = ''
-                        else:
-                            row[field] = str(value)
-                    else:
+                for field in final_fields:
+                    value = p.get(field, '')
+                    if isinstance(value, bool):
+                        row[field] = str(value)
+                    elif isinstance(value, list):
+                        row[field] = '; '.join(str(v) for v in value)
+                    elif value is None:
                         row[field] = ''
+                    else:
+                        row[field] = str(value)
+                    if field in name_fields and row[field]:
+                        row[field] = capitalize_name(row[field])
                 writer.writerow(row)
-        
+
         print(f"CSV file generated successfully: {output_file}")
-        print(f"Total records: {len(registrations)}")
-        print(f"Total columns: {len(ordered_fields)}")
+        print(f"Total records (participants): {len(participants)}")
+        print(f"Total registrations (families): {len(registrations)}")
+        print(f"Total columns: {len(final_fields)}")
     except Exception as e:
         print(f"Error generating CSV file: {e}", file=sys.stderr)
         sys.exit(1)
 
 
 def generate_attendance_pdf(registrations, output_file='lista_presenca.pdf'):
-    """Generate PDF attendance list with participant names in alphabetical order."""
+    """Generate PDF attendance list with all participants (principal + dependentes) in alphabetical order."""
     try:
-        participants = []
+        participants_expanded = expand_participants(registrations)
+        names = []
 
-        for reg in registrations:
-            user_name = None
-            if 'nomeCompleto' in reg:
-                user_name = extract_dynamodb_value(reg['nomeCompleto'])
-
-            if not user_name:
-                for field in ['name', 'userName', 'user_name', 'nome', 'username', 'Name', 'UserName']:
-                    if field in reg:
-                        user_name = extract_dynamodb_value(reg[field])
-                        if user_name:
-                            break
+        for p in participants_expanded:
+            user_name = p.get('nomeCompleto', '')
+            if isinstance(user_name, str):
+                user_name = user_name.strip()
+            else:
+                user_name = str(user_name).strip() if user_name else ''
 
             if user_name:
-                user_name = capitalize_name(str(user_name))
-                if user_name not in participants:
-                    participants.append(user_name)
+                user_name = capitalize_name(user_name)
+                if user_name not in names:
+                    names.append(user_name)
 
-        participants.sort()
+        names.sort()
 
         doc = SimpleDocTemplate(
             output_file,
@@ -356,8 +425,8 @@ def generate_attendance_pdf(registrations, output_file='lista_presenca.pdf'):
 
         table_data = [['#', 'Nome', 'Presença']]
 
-        for i, participant in enumerate(participants, 1):
-            table_data.append([str(i), participant, ''])
+        for i, name in enumerate(names, 1):
+            table_data.append([str(i), name, ''])
 
         col_widths = [1.5*cm, 12*cm, 3*cm]
         table = Table(table_data, colWidths=col_widths, repeatRows=1)
@@ -384,13 +453,13 @@ def generate_attendance_pdf(registrations, output_file='lista_presenca.pdf'):
         elements.append(table)
         elements.append(Spacer(1, 1*cm))
 
-        footer = Paragraph(f"<i>Total de participantes: {len(participants)}</i>", styles['Normal'])
+        footer = Paragraph(f"<i>Total de participantes: {len(names)}</i>", styles['Normal'])
         elements.append(footer)
 
         doc.build(elements)
 
         print(f"Attendance PDF generated successfully: {output_file}")
-        print(f"Total participants: {len(participants)}")
+        print(f"Total participants: {len(names)}")
     except Exception as e:
         print(f"Error generating attendance PDF: {e}", file=sys.stderr)
         sys.exit(1)
@@ -547,25 +616,38 @@ def main():
     """Main function."""
     print("Connecting to DynamoDB...")
     dynamodb = get_dynamodb_client()
-    
+
     table_name = os.getenv('DYNAMODB_TABLE', 'JogaJuntoRegistrations')
     print(f"Fetching registrations from table: {table_name}...")
     registrations = fetch_registrations(dynamodb, table_name)
-    print(f"Found {len(registrations)} registration(s)")
-    
+    print(f"Found {len(registrations)} registration(s) total")
+
+    # Deduplicate by id to avoid processing duplicate scans
+    registrations = deduplicate_by_id(registrations)
+
+    # Filter by current edition (MM-YYYY) and status == 'paid'
+    edition = get_current_edition()
+    print(f"Filtering by edition '{edition}' and status 'paid'...")
+    registrations = filter_by_edition(registrations, edition)
+    total_participants = sum(
+        1 + len(extract_dynamodb_value(reg.get('outros', [])) or [])
+        for reg in registrations
+    )
+    print(f"Paid registrations for edition {edition}: {len(registrations)} (families), {total_participants} participants total")
+
     print("Processing data...")
     user_games = process_registrations(registrations)
-    
+
     # Generate games listing
     games_listing_file = os.getenv('GAMES_LISTING_FILE', 'games_listing.txt')
     print(f"Generating games listing to {games_listing_file}...")
     generate_listing(user_games, games_listing_file)
-    
+
     # Generate gamers list
     gamers_file = os.getenv('GAMERS_FILE', 'gamers.txt')
     print(f"Generating gamers list to {gamers_file}...")
     generate_gamers_list(registrations, gamers_file)
-    
+
     # Generate CSV
     csv_file = os.getenv('CSV_FILE', 'registrations.csv')
     print(f"Generating CSV to {csv_file}...")
@@ -585,4 +667,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
